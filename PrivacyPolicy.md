@@ -1,0 +1,1 @@
+The "New Window to the Right" Chrome extension does not collect, store, or sell any personal information about its users.
