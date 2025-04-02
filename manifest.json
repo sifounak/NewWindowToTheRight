@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "New Window to the Right",
+  "version": "3.2",
+  "description": "Opens a new window directly to the right of the current window and wraps when the window reaches the edge of the monitor.",
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "icons": {
+    "128": "NewWindowToTheRight.png"
+  },
+  "permissions": [
+    "system.display",
+    "declarativeContent"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "128": "NewWindowToTheRight.png"
+    }
+  },
+  "content_security_policy": {}
+}
