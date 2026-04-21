@@ -4,11 +4,32 @@ let processingQueue   = false;
 let lastFocusedWindowId = null;
 let windowListBuffer  = [];
 
-chrome.windows.onCreated.addListener(function(window) {
+chrome.windows.onCreated.addListener(async function(window) {
 	// Add window ID and parent ID to the queue to be processed
-	if( lastFocusedWindowId && window.state == "normal" ){
-		windowListBuffer.push([window.id, lastFocusedWindowId]);
+	let parentId = lastFocusedWindowId;
+
+	if( !parentId ){
+		// Service worker just woke up from dormancy — recover parent from Chrome
+		try {
+			const all = await chrome.windows.getAll({ windowTypes: ['normal'] });
+			const candidate = all.find(w => w.id !== window.id);
+			if( candidate ) parentId = candidate.id;
+		} catch(error) {
+			console.warn('[NewWindowToTheRight] Failed to recover parent window:', error);
+		}
+	}
+
+	if( parentId && window.state == "normal" ){
+		windowListBuffer.push([window.id, parentId]);
 		debugPrint("Added: " + windowListBuffer[0]);
+
+		// Kick the queue here too — onFocusChanged may have already fired
+		// (and found an empty buffer) while we were awaiting getAll above.
+		if( !processingQueue ){
+			debugPrint("Processing Queue: STARTED");
+			processingQueue = true;
+			processQueue();
+		}
 	}
 });
 
@@ -66,7 +87,7 @@ async function processQueue(){
 			await updateWindowPosition([newWin, parentWin, displays]);
 
 		} catch(error) {
-			// Silently catch any errors
+			console.warn('[NewWindowToTheRight] Queue item failed:', error);
 		}
 	}
 
@@ -120,7 +141,7 @@ async function updateWindowPosition(inputObjs){
 				width:  updateVals.width  + dWidth
 			};
 		} catch(error) {
-			// Failed to update, stop trying
+			console.warn('[NewWindowToTheRight] Update attempt failed:', error);
 			break;
 		}
 	}
@@ -181,6 +202,17 @@ function printBuffer(){
 	};
 	debugPrint(str.join("\n"));
 };
+
+chrome.runtime.onStartup.addListener(async function(){
+	// Chrome just launched — seed lastFocusedWindowId before the user can Ctrl+N
+	try {
+		const lastWindow = await chrome.windows.getLastFocused();
+		if( lastWindow ) lastFocusedWindowId = lastWindow.id;
+		debugPrint("Startup focused window: " + lastFocusedWindowId);
+	} catch(error) {
+		console.warn('[NewWindowToTheRight] onStartup init failed:', error);
+	}
+});
 
 chrome.runtime.onInstalled.addListener(async function(){
 
