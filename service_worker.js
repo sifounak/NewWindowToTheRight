@@ -69,6 +69,15 @@ async function processQueue(){
 						} catch(e) { /* fall through to estimated positioning */ }
 					}
 				}
+			} else {
+				// Service worker cold-start: parentId was null because
+				// lastFocusedWindowId is lost across dormancy. Recover
+				// the actual parent from the existing window list.
+				try {
+					const allWindows = await chrome.windows.getAll({ windowTypes: ['normal'] });
+					const candidate = allWindows.find(w => w.id !== queueData[0]);
+					if( candidate ) parentWin = candidate;
+				} catch(e) { /* fall through to estimated positioning */ }
 			}
 
 			// Get display info
