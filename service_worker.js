@@ -3,28 +3,17 @@ let debugFlag         = false;
 let processingQueue   = false;
 let lastFocusedWindowId = null;
 let windowListBuffer  = [];
+const CASCADE_OFFSET  = 26;   // Approximate OS cascade delta (pixels, 100% DPI)
 
-chrome.windows.onCreated.addListener(async function(window) {
+chrome.windows.onCreated.addListener(function(window) {
 	// Add window ID and parent ID to the queue to be processed
+	// parentId is null when the service worker just woke from dormancy
 	let parentId = lastFocusedWindowId;
 
-	if( !parentId ){
-		// Service worker just woke up from dormancy — recover parent from Chrome
-		try {
-			const all = await chrome.windows.getAll({ windowTypes: ['normal'] });
-			const candidate = all.find(w => w.id !== window.id);
-			if( candidate ) parentId = candidate.id;
-		} catch(error) {
-			console.warn('[NewWindowToTheRight] Failed to recover parent window:', error);
-		}
-	}
-
-	if( parentId && window.state == "normal" ){
+	if( window.state == "normal" ){
 		windowListBuffer.push([window.id, parentId]);
 		debugPrint("Added: " + windowListBuffer[0]);
 
-		// Kick the queue here too — onFocusChanged may have already fired
-		// (and found an empty buffer) while we were awaiting getAll above.
 		if( !processingQueue ){
 			debugPrint("Processing Queue: STARTED");
 			processingQueue = true;
@@ -68,23 +57,30 @@ async function processQueue(){
 			const newWin = await chrome.windows.get(queueData[0]);
 
 			// Fetch parent window with error recovery
-			let parentWin;
-			try {
-				parentWin = await chrome.windows.get(queueData[1]);
-			} catch(error) {
-				// Parent window was closed, fallback to most recent focused window
-				if( lastFocusedWindowId ){
-					parentWin = await chrome.windows.get(lastFocusedWindowId);
-				} else {
-					throw new Error('No parent window available');
+			let parentWin = null;
+			if( queueData[1] ){
+				try {
+					parentWin = await chrome.windows.get(queueData[1]);
+				} catch(error) {
+					// Parent window was closed, try most recent focused window
+					if( lastFocusedWindowId ){
+						try {
+							parentWin = await chrome.windows.get(lastFocusedWindowId);
+						} catch(e) { /* fall through to estimated positioning */ }
+					}
 				}
 			}
 
 			// Get display info
 			const displays = await chrome.system.display.getInfo();
 
-			// Update window position
-			await updateWindowPosition([newWin, parentWin, displays]);
+			if( parentWin ){
+				// Parent available — use its position and size
+				await updateWindowPosition(newWin, parentWin, displays);
+			} else {
+				// Parent unavailable — estimate position from the new window itself
+				await updateWindowPositionEstimated(newWin, displays);
+			}
 
 		} catch(error) {
 			console.warn('[NewWindowToTheRight] Queue item failed:', error);
@@ -96,16 +92,49 @@ async function processQueue(){
 	debugPrint("Processing Queue: STOPPED");
 }
 
-async function updateWindowPosition(inputObjs){
+async function updateWindowPositionEstimated(newWindow, displays){
+	// Fallback when parent window is unavailable (e.g. service worker cold-start).
+	// Estimates the parent position from the new window's Chrome-assigned position
+	// by reversing the OS cascade offset, then applies horizontal overflow check.
+
+	// Chrome's windows API uses DIPs (device-independent pixels), but the OS
+	// cascade offset is in physical pixels. Scale accordingly.
+	const scaleFactor = getScaleFactorForWindow(newWindow, displays);
+	const cascadeDIPs = Math.round(CASCADE_OFFSET / scaleFactor);
+
+	const estimatedParentLeft = newWindow.left - cascadeDIPs;
+	const estimatedParentTop  = newWindow.top  - cascadeDIPs;
+
+	// Build a synthetic parent for the horizontal overflow check
+	const syntheticParent = { left: estimatedParentLeft, top: estimatedParentTop };
+	const finalLeft = computeWindowPosition(newWindow, syntheticParent, displays);
+
+	const goalVals = {
+		left: finalLeft,
+		top:  estimatedParentTop
+	};
+
+	await applyWindowUpdate(newWindow.id, goalVals);
+}
+
+function getScaleFactorForWindow(win, displays){
+	// Find which display contains the window and return its scale factor.
+	for( const display of displays ){
+		const area = display.workArea;
+		if( win.left >= area.left && win.left < area.left + area.width &&
+		    win.top  >= area.top  && win.top  < area.top + area.height ){
+			return display.deviceScaleFactor || 1;
+		}
+	}
+	// Default to first display's scale factor, or 1
+	return (displays.length && displays[0].deviceScaleFactor) || 1;
+}
+
+async function updateWindowPosition(newWindow, parentWindow, displays){
 	// Computes the target position properties of newWindow and tries
 	// multiple times to update the position to match
 	// NOTE: Multiple attempts are sometimes required when desktop scaling is enabled and
 	//       chrome is unable to match the pixels exactly on the first try (if at all)
-
-	// Parse inputObjs
-	const newWindow    = inputObjs[0];
-	const parentWindow = inputObjs[1];
-	const displays     = inputObjs[2];
 
 	// Compute target positions
 	const finalLeft  = computeWindowPosition(newWindow, parentWindow, displays);
@@ -116,30 +145,31 @@ async function updateWindowPosition(inputObjs){
 		width:  parentWindow.width
 	};
 
-	// Update with retry logic (max 3 attempts)
+	await applyWindowUpdate(newWindow.id, goalVals);
+}
+
+async function applyWindowUpdate(windowId, goalVals){
+	// Tries multiple times to update window position to match goalVals.
+	// Multiple attempts are sometimes required when desktop scaling is enabled and
+	// Chrome is unable to match the pixels exactly on the first try (if at all).
+
 	let updateVals = goalVals;
 	for( let attempt = 0; attempt < 3; attempt++ ){
 		try {
-			const updatedWin = await chrome.windows.update(newWindow.id, updateVals);
+			const updatedWin = await chrome.windows.update(windowId, updateVals);
 
 			// Check if position matches goal
-			const dLeft   = goalVals.left   - updatedWin.left;
-			const dTop    = goalVals.top    - updatedWin.top;
-			const dHeight = goalVals.height - updatedWin.height;
-			const dWidth  = goalVals.width  - updatedWin.width;
-
-			if( Math.abs(dLeft) + Math.abs(dTop) + Math.abs(dWidth) + Math.abs(dHeight) === 0 ){
-				// Position matches perfectly, we're done
-				break;
+			let totalDrift = 0;
+			let nextVals = {};
+			for( const key of Object.keys(goalVals) ){
+				const d = goalVals[key] - updatedWin[key];
+				totalDrift += Math.abs(d);
+				nextVals[key] = updateVals[key] + d;
 			}
 
-			// Adjust for next attempt
-			updateVals = {
-				left:   updateVals.left   + dLeft,
-				top:    updateVals.top    + dTop,
-				height: updateVals.height + dHeight,
-				width:  updateVals.width  + dWidth
-			};
+			if( totalDrift === 0 ) break;
+
+			updateVals = nextVals;
 		} catch(error) {
 			console.warn('[NewWindowToTheRight] Update attempt failed:', error);
 			break;
