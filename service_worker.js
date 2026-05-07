@@ -78,8 +78,11 @@ async function processQueue(){
 				// Parent available — use its position and size
 				await updateWindowPosition(newWin, parentWin, displays);
 			} else {
-				// Parent unavailable — estimate position from the new window itself
-				await updateWindowPositionEstimated(newWin, displays);
+				// Parent unavailable — estimate position from the new window itself.
+				// If we had a parent ID but it was terminated, Chrome does not apply
+				// its standard cascade offset, so skip the vertical correction.
+				const parentWasTerminated = !!queueData[1];
+				await updateWindowPositionEstimated(newWin, displays, parentWasTerminated);
 			}
 
 		} catch(error) {
@@ -92,10 +95,14 @@ async function processQueue(){
 	debugPrint("Processing Queue: STOPPED");
 }
 
-async function updateWindowPositionEstimated(newWindow, displays){
+async function updateWindowPositionEstimated(newWindow, displays, parentWasTerminated){
 	// Fallback when parent window is unavailable (e.g. service worker cold-start).
 	// Estimates the parent position from the new window's Chrome-assigned position
 	// by reversing the OS cascade offset, then applies horizontal overflow check.
+	//
+	// When the parent was terminated (not a cold-start), Chrome does NOT apply a
+	// cascade offset to the new window, so we must skip the vertical reversal to
+	// avoid overshooting upward.
 
 	// Chrome's windows API uses DIPs (device-independent pixels), but the OS
 	// cascade offset is in physical pixels. Scale accordingly.
@@ -103,7 +110,9 @@ async function updateWindowPositionEstimated(newWindow, displays){
 	const cascadeDIPs = Math.round(CASCADE_OFFSET / scaleFactor);
 
 	const estimatedParentLeft = newWindow.left - cascadeDIPs;
-	const estimatedParentTop  = newWindow.top  - cascadeDIPs;
+	const estimatedParentTop  = parentWasTerminated
+		? newWindow.top
+		: newWindow.top - cascadeDIPs;
 
 	// Build a synthetic parent for the horizontal overflow check
 	const syntheticParent = { left: estimatedParentLeft, top: estimatedParentTop };
