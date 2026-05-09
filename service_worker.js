@@ -1,18 +1,13 @@
 // Initialize global variables
-let debugFlag         = false;
-let processingQueue   = false;
-let lastFocusedWindowId = null;
-let windowListBuffer  = [];
-const CASCADE_OFFSET  = 26;   // Approximate OS cascade delta (pixels, 100% DPI)
+let debugFlag       = false;
+let processingQueue = false;
+let windowListBuffer = [];
 
 chrome.windows.onCreated.addListener(function(window) {
-	// Add window ID and parent ID to the queue to be processed
-	// parentId is null when the service worker just woke from dormancy
-	let parentId = lastFocusedWindowId;
-
+	// Add new window ID to the queue to be processed
 	if( window.state == "normal" ){
-		windowListBuffer.push([window.id, parentId]);
-		debugPrint("Added: " + windowListBuffer[0]);
+		windowListBuffer.push(window.id);
+		debugPrint("Added: " + window.id);
 
 		if( !processingQueue ){
 			debugPrint("Processing Queue: STARTED");
@@ -23,12 +18,6 @@ chrome.windows.onCreated.addListener(function(window) {
 });
 
 chrome.windows.onFocusChanged.addListener(function(windowID){
-	// Track the most recently focused window
-	if( windowID > 0 ){
-		lastFocusedWindowId = windowID;
-		debugPrint("Focused: " + lastFocusedWindowId);
-	}
-
 	// Start processing the window list if it is not already processing
 	if( !processingQueue && windowListBuffer.length ){
 		debugPrint("Processing Queue: STARTED");
@@ -37,48 +26,26 @@ chrome.windows.onFocusChanged.addListener(function(windowID){
 	}
 });
 
-chrome.windows.onRemoved.addListener(function(windowID) {
-	// Clear last focused window if it was closed
-	if( windowID === lastFocusedWindowId ){
-		lastFocusedWindowId = null;
-	}
-});
-
 async function processQueue(){
 	// Process the windowListBuffer until it is empty
 
 	while( windowListBuffer.length ){
 		// Pull top entry
-		const queueData = windowListBuffer.shift();
-		debugPrint("Processing Queue: " + queueData);
+		const newWindowId = windowListBuffer.shift();
+		debugPrint("Processing Queue: " + newWindowId);
 
 		try {
 			// Fetch new window
-			const newWin = await chrome.windows.get(queueData[0]);
+			const newWin = await chrome.windows.get(newWindowId);
 
-			// Fetch parent window with error recovery
+			// Ask Chrome for the most recently focused window
 			let parentWin = null;
-			if( queueData[1] ){
-				try {
-					parentWin = await chrome.windows.get(queueData[1]);
-				} catch(error) {
-					// Parent window was closed, try most recent focused window
-					if( lastFocusedWindowId ){
-						try {
-							parentWin = await chrome.windows.get(lastFocusedWindowId);
-						} catch(e) { /* fall through to estimated positioning */ }
-					}
+			try {
+				const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
+				if( lastFocused && lastFocused.id !== newWindowId ){
+					parentWin = lastFocused;
 				}
-			} else {
-				// Service worker cold-start: parentId was null because
-				// lastFocusedWindowId is lost across dormancy. Recover
-				// the actual parent from the existing window list.
-				try {
-					const allWindows = await chrome.windows.getAll({ windowTypes: ['normal'] });
-					const candidate = allWindows.find(w => w.id !== queueData[0]);
-					if( candidate ) parentWin = candidate;
-				} catch(e) { /* fall through to estimated positioning */ }
-			}
+			} catch(e) { /* fall through to horizontal-only positioning */ }
 
 			// Get display info
 			const displays = await chrome.system.display.getInfo();
@@ -87,11 +54,9 @@ async function processQueue(){
 				// Parent available — use its position and size
 				await updateWindowPosition(newWin, parentWin, displays);
 			} else {
-				// Parent unavailable — estimate position from the new window itself.
-				// If we had a parent ID but it was terminated, Chrome does not apply
-				// its standard cascade offset, so skip the vertical correction.
-				const parentWasTerminated = !!queueData[1];
-				await updateWindowPositionEstimated(newWin, displays, parentWasTerminated);
+				// No reference window — apply horizontal wrap-around only,
+				// let Chrome handle vertical positioning
+				await updateWindowPositionHorizontalOnly(newWin, displays);
 			}
 
 		} catch(error) {
@@ -104,48 +69,16 @@ async function processQueue(){
 	debugPrint("Processing Queue: STOPPED");
 }
 
-async function updateWindowPositionEstimated(newWindow, displays, parentWasTerminated){
-	// Fallback when parent window is unavailable (e.g. service worker cold-start).
-	// Estimates the parent position from the new window's Chrome-assigned position
-	// by reversing the OS cascade offset, then applies horizontal overflow check.
-	//
-	// When the parent was terminated (not a cold-start), Chrome does NOT apply a
-	// cascade offset to the new window, so we must skip the vertical reversal to
-	// avoid overshooting upward.
+async function updateWindowPositionHorizontalOnly(newWindow, displays){
+	// Fallback when no reference window is available.
+	// Applies horizontal wrap-around using the new window's own position,
+	// but leaves vertical positioning to Chrome.
 
-	// Chrome's windows API uses DIPs (device-independent pixels), but the OS
-	// cascade offset is in physical pixels. Scale accordingly.
-	const scaleFactor = getScaleFactorForWindow(newWindow, displays);
-	const cascadeDIPs = Math.round(CASCADE_OFFSET / scaleFactor);
+	const finalLeft = computeWindowPosition(newWindow, newWindow, displays);
 
-	const estimatedParentLeft = newWindow.left - cascadeDIPs;
-	const estimatedParentTop  = parentWasTerminated
-		? newWindow.top
-		: newWindow.top - cascadeDIPs;
-
-	// Build a synthetic parent for the horizontal overflow check
-	const syntheticParent = { left: estimatedParentLeft, top: estimatedParentTop };
-	const finalLeft = computeWindowPosition(newWindow, syntheticParent, displays);
-
-	const goalVals = {
-		left: finalLeft,
-		top:  estimatedParentTop
-	};
-
-	await applyWindowUpdate(newWindow.id, goalVals);
-}
-
-function getScaleFactorForWindow(win, displays){
-	// Find which display contains the window and return its scale factor.
-	for( const display of displays ){
-		const area = display.workArea;
-		if( win.left >= area.left && win.left < area.left + area.width &&
-		    win.top  >= area.top  && win.top  < area.top + area.height ){
-			return display.deviceScaleFactor || 1;
-		}
+	if( finalLeft !== newWindow.left ){
+		await applyWindowUpdate(newWindow.id, { left: finalLeft });
 	}
-	// Default to first display's scale factor, or 1
-	return (displays.length && displays[0].deviceScaleFactor) || 1;
 }
 
 async function updateWindowPosition(newWindow, parentWindow, displays){
@@ -240,44 +173,13 @@ function debugPrint(inputObj){
 	};
 };
 
-function printBuffer(){
-	// Shorcut function to print windowListBuffer to console
-	let str = ["Queue:"];
-	for( let ii = 0; ii < windowListBuffer.length; ii++ ){
-		str[ii+1] = windowListBuffer[ii][0].toString() 
-		+ " " + windowListBuffer[ii][1].toString() 
-		+ " " + windowListBuffer[ii][2].toString();
-	};
-	debugPrint(str.join("\n"));
-};
-
-chrome.runtime.onStartup.addListener(async function(){
-	// Chrome just launched — seed lastFocusedWindowId before the user can Ctrl+N
-	try {
-		const lastWindow = await chrome.windows.getLastFocused();
-		if( lastWindow ) lastFocusedWindowId = lastWindow.id;
-		debugPrint("Startup focused window: " + lastFocusedWindowId);
-	} catch(error) {
-		console.warn('[NewWindowToTheRight] onStartup init failed:', error);
-	}
-});
-
 chrome.runtime.onInstalled.addListener(async function(){
-
-	// Set the last focused window
-	const lastWindow = await chrome.windows.getLastFocused();
-	lastFocusedWindowId = lastWindow.id;
-	debugPrint("Initial focused window: " + lastFocusedWindowId);
-
 	// Enable the page action on all domains
 	await chrome.declarativeContent.onPageChanged.removeRules();
 	await chrome.declarativeContent.onPageChanged.addRules([{
 		conditions: [new chrome.declarativeContent.PageStateMatcher({
-			// pageUrl: {hostEquals: 'developer.chrome.com'},
 		})
 		],
 		actions: [new chrome.declarativeContent.ShowAction()]
 	}]);
- });
- 
- 
+});
