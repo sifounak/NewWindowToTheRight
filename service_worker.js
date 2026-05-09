@@ -1,13 +1,15 @@
 // Initialize global variables
 let debugFlag       = false;
 let processingQueue = false;
+let lastFocusedWindowId = null;
 let windowListBuffer = [];
 
 chrome.windows.onCreated.addListener(function(window) {
-	// Add new window ID to the queue to be processed
+	// Capture lastFocusedWindowId synchronously — this is the moment before
+	// Chrome shifts focus to the new window.
 	if( window.state == "normal" ){
-		windowListBuffer.push(window.id);
-		debugPrint("Added: " + window.id);
+		windowListBuffer.push([window.id, lastFocusedWindowId]);
+		debugPrint("Added: " + window.id + " ref: " + lastFocusedWindowId);
 
 		if( !processingQueue ){
 			debugPrint("Processing Queue: STARTED");
@@ -18,6 +20,11 @@ chrome.windows.onCreated.addListener(function(window) {
 });
 
 chrome.windows.onFocusChanged.addListener(function(windowID){
+	// Track the most recently focused window
+	if( windowID > 0 ){
+		lastFocusedWindowId = windowID;
+	}
+
 	// Start processing the window list if it is not already processing
 	if( !processingQueue && windowListBuffer.length ){
 		debugPrint("Processing Queue: STARTED");
@@ -30,22 +37,33 @@ async function processQueue(){
 	// Process the windowListBuffer until it is empty
 
 	while( windowListBuffer.length ){
-		// Pull top entry
-		const newWindowId = windowListBuffer.shift();
-		debugPrint("Processing Queue: " + newWindowId);
+		// Pull top entry [newWindowId, referenceWindowId]
+		const queueData = windowListBuffer.shift();
+		const newWindowId = queueData[0];
+		const referenceWinId = queueData[1];
+		debugPrint("Processing Queue: " + newWindowId + " ref: " + referenceWinId);
 
 		try {
 			// Fetch new window
 			const newWin = await chrome.windows.get(newWindowId);
 
-			// Ask Chrome for the most recently focused window
+			// Fetch reference window
 			let parentWin = null;
-			try {
-				const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
-				if( lastFocused && lastFocused.id !== newWindowId ){
-					parentWin = lastFocused;
-				}
-			} catch(e) { /* fall through to horizontal-only positioning */ }
+			if( referenceWinId ){
+				// Normal case: reference was captured in-memory before focus shifted
+				try {
+					parentWin = await chrome.windows.get(referenceWinId);
+				} catch(e) { /* reference was closed, fall through */ }
+			} else {
+				// Cold-start: service worker woke on this event, lastFocusedWindowId
+				// was null. Use getLastFocused() to recover the reference from Chrome.
+				try {
+					const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
+					if( lastFocused && lastFocused.id !== newWindowId ){
+						parentWin = lastFocused;
+					}
+				} catch(e) { /* fall through to horizontal-only positioning */ }
+			}
 
 			// Get display info
 			const displays = await chrome.system.display.getInfo();
